@@ -3,6 +3,8 @@ __pycache__/
 *.py[cod]
 *$py.class
 my_assemblies/
+output_genomeqc/
+gc_species/ 
 
 # C extensions
 *.so

@@ -1,10 +1,45 @@
+
+"""
+Module: get_assembly
+
+This module provides functions to extract genome assembly files for specific species or accession codes
+from compressed tar.xz archives, supporting both single-threaded and batch (SLURM) extraction modes.
+
+Functions:
+    extract_species(
+    ) -> None
+        Given a species name, ensures a Parquet file exists for the file list, loads it, finds all paths
+        for the species, and extracts them to the output directory using tar. Supports batch extraction
+        via SLURM job scripts.
+
+    ) -> None
+        Given a list of accession codes, ensures a Parquet file exists for the file list, loads it,
+        finds all paths for the accessions, and extracts them to the output directory using tar.
+        Supports both single-threaded and batch (SLURM) extraction.
+
+    submit_jobs(slurm_scripts: List[str]) -> None
+        Submits a list of SLURM job scripts for batch extraction, tracks job IDs, and writes a summary
+        CSV file with job IDs and script paths.
+
+    create_folder_structure(accession: str, base_dir: str) -> str
+        Creates a nested folder structure based on the accession code to avoid too many files in a single
+        directory. Returns the final directory path.
+
+    extract_single_thread(row, archive_dir: str, output_dir: str) -> None
+        Extracts a single file from a tar.xz archive in a single-threaded manner.
+
+Dependencies:
+    - pandas (for DataFrame operations)
+    - bigscript.conf (for configuration paths)
+    - bigscript.util (for Parquet file list loading)
+    - SLURM (for batch job submission)
+    - tar, xz, pigz (for file extraction and compression)
+"""
 import os
 import subprocess
 from typing import List
 import sys
 import logging
-import time
-import subprocess
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 from bigscript.conf import FILE_LIST_PATH, ATB_ARCHIVE_PATH, PQ_FILE_LIST_PATH, TEMP_DIR
 from bigscript.util import get_parquet_file_list
@@ -96,26 +131,30 @@ def extract_accessions(
                 f.write(f"#SBATCH --job-name=extract_{idx}\n")
                 f.write(f"#SBATCH --output={log_dir}/extract_{idx}.out\n")
                 f.write(f"#SBATCH --error={log_dir}/extract_{idx}.err\n")
-                f.write("#SBATCH --time=00:10:00\n")
+                f.write("#SBATCH --time=02:00:00\n")
                 f.write("#SBATCH --mem=4G\n")
                 f.write("#SBATCH --cpus-per-task=4\n\n")
                 f.write("set -e\n\n")
+                # Extract only the needed files from the tarball
+                files_args = " ".join([f"'{file}'" for file in files])
                 f.write(
                     f"tar --use-compress-program='xz -T4' -xvf {tarball_path} "
-                    f"--strip-components={strip_components} -C {TEMP_DIR}\n"
+                    f"--strip-components={strip_components} -C {TEMP_DIR} {files_args}\n"
                 )
                 for filename in files:
                     final_path = create_folder_structure(os.path.basename(filename).split('.')[0], output_dir)
                     f.write(f"mv {TEMP_DIR}/{os.path.basename(filename)} {final_path}/\n")
+                    # gzip the file 
+                    f.write(f"pigz -p 4 {final_path}/{os.path.basename(filename)}\n")
             os.chmod(script_path, 0o755)
             slurm_scripts.append(script_path)
-            logging.info(f"SLURM extraction script created at {script_path}")
+            logging.info("SLURM extraction script created at %s", script_path)
         # Optionally submit jobs, but do not exceed max_jobs running at once
         if submit:
             if len(slurm_scripts) > max_jobs:
-                logging.warning(f"More than {max_jobs} jobs to submit.")
-                raise ValueError(f"Too many jobs to submit at once. Please reduce the number of accessions or increase max_jobs.")
-            logging.info(f"Submitting {len(slurm_scripts)} SLURM jobs.")
+                logging.warning("More than %d jobs to submit.", max_jobs)
+                raise ValueError("Too many jobs to submit at once. Please reduce the number of accessions or increase max_jobs.")
+            logging.info("Submitting %d SLURM jobs.", len(slurm_scripts))
             submit_jobs(slurm_scripts)
     else:
         for _, row in filtered.iterrows():
@@ -123,26 +162,27 @@ def extract_accessions(
 
 
 def submit_jobs(slurm_scripts: List[str]) -> None:
-    running = set()
+    running_jobs = {}
     for script in slurm_scripts:
-        sbatch_proc = subprocess.run(["sbatch", script], capture_output=True, text=True)
+        sbatch_proc = subprocess.run(["sbatch", script], capture_output=True, text=True, check=False)
         if sbatch_proc.returncode == 0:
             # Extract job ID from output
             for part in sbatch_proc.stdout.split():
                 if part.isdigit():
-                    running.add(int(part))
+                    running_jobs[int(part)] = script
                     break
-            logging.info(f"Submitted SLURM job for {script}: {sbatch_proc.stdout.strip()}")
+            logging.info("Submitted SLURM job for %s: %s", script, sbatch_proc.stdout.strip())
         else:
-            logging.error(f"Failed to submit SLURM job for {script}: {sbatch_proc.stderr.strip()}")
+            logging.error("Failed to submit SLURM job for %s: %s", script, sbatch_proc.stderr.strip())
     # write a table to outdir with the job IDs and script names
-    job_table_path = os.path.join(os.path.dirname(slurm_scripts[0]), "submitted_jobs.tsv")
+    job_table_path = os.path.join(os.path.dirname(slurm_scripts[0]), "submitted_jobs.csv")
     with open(job_table_path, 'w', encoding='utf-8') as f:
-        f.write("job_id\tscript\n")
-        for script in slurm_scripts:
-            job_id = os.path.basename(script).split('.')[0].replace('extract_', '')
-            f.write(f"{job_id}\t{script}\n")
-    logging.info(f"Submitted jobs written to {job_table_path}")
+        f.write("job_id,script\n")
+        for job_id, script in running_jobs.items():
+            f.write(f"{job_id},{script}\n")
+        logging.info("Submitted jobs written to %s", job_table_path)
+        logging.info("You can review the status of these jobs using the job_status command.")
+        logging.info("python bigscript-run.py job-status %s", job_table_path)
 
 def create_folder_structure(accession: str, base_dir: str) -> str:
     """
